@@ -331,6 +331,7 @@ var fromEmbedded = false, hiddenAt = 0;
 // Kullanılan değer her kaydın içine yazılır; eski kayıtlar kendi değeriyle açılır.
 var ITER_NATIVE = 600000, ITER_JS = 200000, AUTO_LOCK_MS = 5 * 60 * 1000;
 var MIN_PW = 10, MAX_FILE = 25 * 1024 * 1024;
+var MAX_SHEETS = 50, MAX_ROWS = 200000, MAX_COLS = 300, MAX_TOTAL_ROWS = 300000;
 var fails = 0, lockedUntil = 0, idleTimer = null, lastTouch = 0;
 var FORCE_JS = location.hash === '#nosubtle';
 var cur = null, showEmpty = false, detailOpen = false, pushed = false;
@@ -412,7 +413,11 @@ function decrypt(raw, iv, ct){
 function wipeKey(){ try{ if (KEY && KEY.raw && KEY.raw.fill) KEY.raw.fill(0); }catch(e){} KEY = null; }
 function newKey(pw){
   var salt = rnd(16), iter = subtle ? ITER_NATIVE : ITER_JS;
-  return derive(pw, salt, iter).then(function(raw){ KEY = {raw:raw, salt:salt, iter:iter}; });
+  // Bekleyen kayıt eski anahtarla bitsin, sonra eski anahtar sıfırlanıp yenisi devreye girsin.
+  return persistChain.catch(function(){}).then(function(){ return derive(pw, salt, iter); }).then(function(raw){
+    wipeKey();
+    KEY = {raw:raw, salt:salt, iter:iter};
+  });
 }
 // Veriyi şifreleyip telefona yazar. Dönen değer: telefona kaydedilebildi mi.
 var persistChain = Promise.resolve(), persistTimer;
@@ -542,6 +547,7 @@ function readFile(file){
     setTimeout(function(){
       try{
         var wb = XLSX.read(new Uint8Array(buf), {type:'array', cellNF:true});
+        if (wb.SheetNames.length > MAX_SHEETS) throw new Error('dosyada çok fazla sayfa var (en fazla ' + MAX_SHEETS + ')');
         var old = {};
         if (DB) DB.sheets.forEach(function(s){ old[s.name] = s; });
         var sheets = [], unsure = [];
@@ -556,6 +562,8 @@ function readFile(file){
           sheets.push(sh);
         });
         if (!sheets.length){ loading(false); toast('Dosyada veri bulunamadı'); return; }
+        var allRows = sheets.reduce(function(a, s){ return a + s.rows.length; }, 0);
+        if (allRows > MAX_TOTAL_ROWS) throw new Error('toplam ' + num(allRows) + ' satır var (en fazla ' + num(MAX_TOTAL_ROWS) + ')');
         var fresh = {fileName:file.name, loadedAt:Date.now(), sheets:sheets};
         loading(false);
         var ready = KEY ? Promise.resolve(true)
@@ -617,10 +625,12 @@ function parseSheet(ws, name){
     if (any) rows.push(out);
   }
   if (!rows.length) return null;
+  if (rows.length > MAX_ROWS) throw new Error('"' + name + '" sayfasında ' + num(rows.length) + ' satır var (en fazla ' + num(MAX_ROWS) + ')');
   // tamamen boş sütunları at
   var keep = headers.map(function(_, c){ for (var r=0;r<rows.length;r++) if (rows[r][c]) return true; return false; });
   headers = headers.filter(function(_, c){ return keep[c]; });
   rows = rows.map(function(r){ return r.filter(function(_, c){ return keep[c]; }); });
+  if (headers.length > MAX_COLS) throw new Error('"' + name + '" sayfasında ' + headers.length + ' sütun var (en fazla ' + MAX_COLS + ')');
   var det = detectCfg(headers);
   return {name:name, headers:headers, rows:rows, cfg:det.cfg, sure:det.sure};
 }
@@ -970,7 +980,8 @@ function armIdle(){ clearTimeout(idleTimer); if (DB) idleTimer = setTimeout(lock
 });
 document.addEventListener('visibilitychange', function(){
   if (document.hidden){ hiddenAt = Date.now(); return; }
-  if (DB && hiddenAt && Date.now() - hiddenAt > AUTO_LOCK_MS) lockNow();
+  if (DB && hiddenAt && Date.now() - hiddenAt > AUTO_LOCK_MS) lockNow(); else armIdle();
+  hiddenAt = 0;
 });
 $('sheetBg').addEventListener('click', function(e){ if (e.target === this) closeSheet(); });
 $('filters').addEventListener('click', function(e){ var b = e.target.closest('.chip'); if (!b) return; sheetFilter = +b.dataset.s; search(); });
